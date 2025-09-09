@@ -1,0 +1,89 @@
+import 'dotenv/config';
+import axios from 'axios';
+import { Client, GatewayIntentBits, Partials } from 'discord.js';
+import { joinVoiceChannel, EndBehaviorType, createAudioPlayer, createAudioResource, VoiceConnectionStatus } from '@discordjs/voice';
+import prism from 'prism-media';
+import FormData from 'form-data';
+
+const TOKEN = process.env.DISCORD_BOT_TOKEN;
+const PY_API_BASE = process.env.PY_API_BASE || 'http://127.0.0.1:8000';
+if (!TOKEN) { console.error('Missing DISCORD_BOT_TOKEN'); process.exit(1); }
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates],
+  partials: [Partials.Channel]
+});
+
+const players = new Map();
+
+client.once('ready', () => console.log(`Logged in as ${client.user.tag}`));
+
+client.on('messageCreate', async (msg) => {
+  if (!msg.guild || msg.author.bot) return;
+  const content = msg.content.trim();
+
+  if (content.startsWith('!join')) {
+    const member = await msg.guild.members.fetch(msg.author.id);
+    const voice = member.voice?.channel;
+    if (!voice) return msg.reply('Зайдите в голосовой канал и повторите !join');
+    await joinAndRecord(voice, msg.channel);
+    msg.reply(`Подключился к ${voice.name}. Говорите — транскрибирую. Напишите !finish чтобы завершить.`);
+  }
+
+  if (content.startsWith('!finish')) {
+    try {
+      const fd = new FormData();
+      fd.append('channel_id', msg.channel.id);
+      fd.append('candidate_id', '');
+      const resp = await axios.post(`${PY_API_BASE}/finish`, fd, { headers: fd.getHeaders() });
+      msg.reply(`Решение: ${resp.data.decision}. ${resp.data.report ? 'Отчет: ' + resp.data.report : ''}`);
+    } catch (e) { msg.reply('Завершил. (не удалось получить решение)'); }
+  }
+});
+
+async function joinAndRecord(voiceChannel, textChannel) {
+  const connection = joinVoiceChannel({
+    channelId: voiceChannel.id,
+    guildId: voiceChannel.guild.id,
+    adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+    selfDeaf: false,
+    selfMute: false
+  });
+
+  connection.on(VoiceConnectionStatus.Ready, () => console.log('Voice ready.'));
+  const receiver = connection.receiver;
+
+  receiver.speaking.on('start', (userId) => {
+    const opusStream = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 } });
+    const pcm = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+    const chunks = [];
+    opusStream.pipe(pcm);
+    pcm.on('data', (buf) => chunks.push(buf));
+    pcm.on('end', async () => {
+      if (!chunks.length) return;
+      const pcmBuf = Buffer.concat(chunks);
+      try {
+        const fd = new FormData();
+        fd.append('channel_id', textChannel.id);
+        fd.append('user_id', userId);
+        const blob = new Blob([pcmBuf], { type: 'application/octet-stream' });
+        fd.append('audio', blob, 'audio.pcm');
+        const { data } = await axios.post(`${PY_API_BASE}/stt`, fd, { headers: fd.getHeaders(), maxBodyLength: Infinity });
+        if (data.text) await textChannel.send(`🗣️ <@${userId}>: ${data.text}`);
+        if (data.next_question) {
+          await textChannel.send(`🤖 Вопрос: ${data.next_question}`);
+          try {
+            const stream = (await axios.get(`${PY_API_BASE}/tts`, { params: { text: data.next_question }, responseType: 'stream' })).data;
+            const player = players.get(voiceChannel.id) || createAudioPlayer();
+            players.set(voiceChannel.id, player);
+            const resource = createAudioResource(stream);
+            connection.subscribe(player);
+            player.play(resource);
+          } catch (e) { console.warn('TTS play failed:', e.message); }
+        }
+      } catch (e) { console.warn('STT error:', e.message); }
+    });
+  });
+}
+
+client.login(TOKEN);

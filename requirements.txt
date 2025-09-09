@@ -1,0 +1,11 @@
+python-telegram-bot==21.4
+phonenumbers
+pdfminer.six
+docx2txt
+striprtf
+pydantic>=2
+python-dotenv
+jinja2
+markdown
+fastapi
+uvicorn
