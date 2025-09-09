@@ -1,0 +1,5 @@
+.env
+**/.env
+*.env
+voice_bridge_node/.env
+app/**/secrets*.json
